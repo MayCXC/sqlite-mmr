@@ -1,5 +1,5 @@
 /*
-** sqlite_mmr.c - Jaccard MMR virtual table for diversity reranking.
+** mmr0.c - Jaccard MMR virtual table for diversity reranking.
 **
 ** Provides Jaccard-similarity-based Maximal Marginal Relevance (MMR)
 ** reranking.  Wraps any MATCH-capable table (FTS5, etc.) and reranks
@@ -17,7 +17,7 @@
 ** BSD 3-Clause License. See LICENSE for details.
 */
 
-#include "sqlite_mmr.h"
+#include "mmr0.h"
 
 #include <stdarg.h>
 #include <stdlib.h>
