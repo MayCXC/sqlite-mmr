@@ -1,5 +1,5 @@
 /*
-** sqlite-mmr.h — MMR diversity reranking, Jaccard similarity, FTS5 token extraction.
+** sqlite_mmr.h — MMR diversity reranking, Jaccard similarity, FTS5 token extraction.
 **
 ** BSD 3-Clause License. See LICENSE for details.
 */

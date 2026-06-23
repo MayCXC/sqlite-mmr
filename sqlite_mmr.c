@@ -1,5 +1,5 @@
 /*
-** sqlite-mmr.c - Jaccard MMR virtual table for diversity reranking.
+** sqlite_mmr.c - Jaccard MMR virtual table for diversity reranking.
 **
 ** Provides Jaccard-similarity-based Maximal Marginal Relevance (MMR)
 ** reranking.  Wraps any MATCH-capable table (FTS5, etc.) and reranks
@@ -17,9 +17,8 @@
 ** BSD 3-Clause License. See LICENSE for details.
 */
 
-#include "sqlite-mmr.h"
+#include "sqlite_mmr.h"
 
-#include <ctype.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,30 +85,22 @@ static int cmp_str(const void *a, const void *b) {
 }
 
 /*
-** Tokenize text: lowercase, split on non-alnum/underscore.
-** Does NOT sort or dedup. Use mmr_tokenset_sort_dedup after if needed.
+** Split pre-tokenized text on whitespace into a token set.
+** Input is expected to be space-separated lowercase tokens
+** (e.g. from match_tokens()).
 */
-static int mmr_tokenset_tokenize(mmr_tokenset *ts, const char *text) {
+static int mmr_tokenset_split(mmr_tokenset *ts, const char *text) {
   if (!text)
     return SQLITE_OK;
   const char *p = text;
   while (*p) {
-    while (*p && !(isalnum((unsigned char)*p) || *p == '_'))
-      p++;
-    if (!*p)
-      break;
+    while (*p == ' ') p++;
+    if (!*p) break;
     const char *start = p;
-    while (*p && (isalnum((unsigned char)*p) || *p == '_'))
-      p++;
+    while (*p && *p != ' ') p++;
     int len = (int)(p - start);
-    if (len == 0)
-      continue;
-    char buf[256];
-    if (len > 255)
-      len = 255;
-    for (int i = 0; i < len; i++)
-      buf[i] = (char)tolower((unsigned char)start[i]);
-    int rc = mmr_tokenset_push(ts, buf, len);
+    if (len == 0) continue;
+    int rc = mmr_tokenset_push(ts, start, len);
     if (rc != SQLITE_OK)
       return rc;
   }
@@ -464,7 +455,7 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   if (mmr_lambda < 1.0 && n > 1) {
     /* Tokenize all text */
     for (int i = 0; i < n; i++) {
-      rc = mmr_tokenset_tokenize(&rows[i].tokens, rows[i].text);
+      rc = mmr_tokenset_split(&rows[i].tokens, rows[i].text);
       if (rc != SQLITE_OK) {
         for (int j = 0; j < n; j++)
           mmr_row_free(&rows[j]);
@@ -649,43 +640,6 @@ static sqlite3_module mmrModule = {
 #endif
 };
 
-/* ---- tokenize() scalar function -------------------------------------- */
-/*
-** tokenize(text) — returns lowercase tokens separated by spaces.
-** Lexical normalization only: lowercase, split on non-alnum/underscore.
-** Does NOT sort or deduplicate (that is jaccard's job).
-*/
-static void sql_tokenize(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  (void)argc;
-  const char *text = (const char *)sqlite3_value_text(argv[0]);
-  mmr_tokenset ts;
-  mmr_tokenset_init(&ts);
-  mmr_tokenset_tokenize(&ts, text);
-
-  int total_len = 0;
-  for (int i = 0; i < ts.n; i++)
-    total_len += strlen(ts.tokens[i]) + 1;
-
-  if (total_len == 0) {
-    sqlite3_result_text(ctx, "", 0, SQLITE_STATIC);
-  } else {
-    char *out = sqlite3_malloc(total_len);
-    if (!out) { sqlite3_result_error_nomem(ctx); }
-    else {
-      char *p = out;
-      for (int i = 0; i < ts.n; i++) {
-        if (i > 0) *p++ = ' ';
-        int len = strlen(ts.tokens[i]);
-        memcpy(p, ts.tokens[i], len);
-        p += len;
-      }
-      *p = '\0';
-      sqlite3_result_text(ctx, out, (int)(p - out), sqlite3_free);
-    }
-  }
-  mmr_tokenset_free(&ts);
-}
-
 /* ---- jaccard() scalar function --------------------------------------- */
 /*
 ** jaccard(a, b) — Jaccard similarity on two text strings.
@@ -699,72 +653,11 @@ static void sql_jaccard(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   mmr_tokenset ta, tb;
   mmr_tokenset_init(&ta);
   mmr_tokenset_init(&tb);
-  mmr_tokenset_tokenize(&ta, a);
-  mmr_tokenset_tokenize(&tb, b);
+  mmr_tokenset_split(&ta, a);
+  mmr_tokenset_split(&tb, b);
   sqlite3_result_double(ctx, mmr_jaccard(&ta, &tb));
   mmr_tokenset_free(&ta);
   mmr_tokenset_free(&tb);
-}
-
-/* ---- match_tokens() FTS5 auxiliary function --------------------------- */
-/*
-** FTS5 auxiliary: returns space-separated matched tokens from the index.
-** Uses xInstCount + xInstToken. No content decompression.
-*/
-static void sql_match_tokens(const Fts5ExtensionApi *pApi,
-                             Fts5Context *pFts,
-                             sqlite3_context *pCtx,
-                             int nVal, sqlite3_value **apVal) {
-  (void)nVal; (void)apVal;
-  int nInst = 0;
-  int rc = pApi->xInstCount(pFts, &nInst);
-  if (rc != SQLITE_OK || nInst == 0) {
-    sqlite3_result_text(pCtx, "", 0, SQLITE_STATIC);
-    return;
-  }
-
-  mmr_tokenset ts;
-  mmr_tokenset_init(&ts);
-
-  for (int i = 0; i < nInst; i++) {
-    int iPhrase, iCol, iOff;
-    rc = pApi->xInst(pFts, i, &iPhrase, &iCol, &iOff);
-    if (rc != SQLITE_OK) break;
-    int nToken = pApi->xPhraseSize(pFts, iPhrase);
-    for (int t = 0; t < nToken; t++) {
-      const char *pTok = NULL;
-      int nTok = 0;
-      rc = pApi->xInstToken(pFts, i, t, &pTok, &nTok);
-      if (rc != SQLITE_OK || !pTok) continue;
-      mmr_tokenset_push(&ts, pTok, nTok);
-    }
-  }
-
-  /* Sort and dedup for consistent output */
-  mmr_tokenset_sort_dedup(&ts);
-
-  int total_len = 0;
-  for (int i = 0; i < ts.n; i++)
-    total_len += strlen(ts.tokens[i]) + 1;
-
-  if (total_len == 0) {
-    sqlite3_result_text(pCtx, "", 0, SQLITE_STATIC);
-  } else {
-    char *out = sqlite3_malloc(total_len);
-    if (!out) { sqlite3_result_error_nomem(pCtx); }
-    else {
-      char *p = out;
-      for (int i = 0; i < ts.n; i++) {
-        if (i > 0) *p++ = ' ';
-        int len = strlen(ts.tokens[i]);
-        memcpy(p, ts.tokens[i], len);
-        p += len;
-      }
-      *p = '\0';
-      sqlite3_result_text(pCtx, out, (int)(p - out), sqlite3_free);
-    }
-  }
-  mmr_tokenset_free(&ts);
 }
 
 /* ---- Entry point ----------------------------------------------------- */
@@ -783,28 +676,8 @@ SQLITE_MMR_API int sqlite3_mmr_init(sqlite3 *db, char **pzErrMsg,
   if (rc != SQLITE_OK) return rc;
 
   /* Scalar functions */
-  rc = sqlite3_create_function(db, "tokenize", 1, SQLITE_UTF8, 0,
-                               sql_tokenize, 0, 0);
-  if (rc != SQLITE_OK) return rc;
   rc = sqlite3_create_function(db, "jaccard", 2, SQLITE_UTF8, 0,
                                sql_jaccard, 0, 0);
-  if (rc != SQLITE_OK) return rc;
-
-  /* FTS5 auxiliary function (match_tokens) */
-  {
-    fts5_api *fts = 0;
-    sqlite3_stmt *stmt = 0;
-    rc = sqlite3_prepare_v2(db, "SELECT fts5(?1)", -1, &stmt, 0);
-    if (rc == SQLITE_OK) {
-      sqlite3_bind_pointer(stmt, 1, &fts, "fts5_api_ptr", 0);
-      sqlite3_step(stmt);
-    }
-    sqlite3_finalize(stmt);
-    if (fts) {
-      rc = fts->xCreateFunction(fts, "match_tokens", 0, sql_match_tokens, 0);
-      if (rc != SQLITE_OK) return rc;
-    }
-  }
 
   return SQLITE_OK;
 }
