@@ -19,6 +19,7 @@
 
 #include "mmr0.h"
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -383,9 +384,11 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   /* Overfetch candidates for MMR reranking */
 #define MMR_OVERFETCH_FACTOR 5
-  int fetch_limit = (mmr_lambda < 1.0) ? k * MMR_OVERFETCH_FACTOR : k;
-  if (fetch_limit < k)
-    fetch_limit = k;
+  int fetch_limit = k;
+  if (mmr_lambda < 1.0)
+    fetch_limit = k > INT_MAX / MMR_OVERFETCH_FACTOR
+                      ? INT_MAX
+                      : k * MMR_OVERFETCH_FACTOR;
 
   int rc = SQLITE_OK;
   sqlite3_stmt *stmt = NULL;
