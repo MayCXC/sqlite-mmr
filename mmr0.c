@@ -14,6 +14,12 @@
 ** SELECT rowid, rank, text FROM t_mmr
 **   WHERE text MATCH :q AND k = :k AND mmr_lambda = :lambda;
 **
+** A rowid IN (...) constraint restricts the candidates to those source
+** rowids before the top k are taken:
+**
+** SELECT rowid, rank, text FROM t_mmr
+**   WHERE text MATCH :q AND k = :k AND rowid IN (SELECT ...);
+**
 ** BSD 3-Clause License. See LICENSE for details.
 */
 
@@ -29,6 +35,12 @@
 SQLITE_EXTENSION_INIT1
 #else
 #include "sqlite3.h"
+#endif
+
+/* sqlite3_vtab_in() was added in SQLite version 3.38 (2022-02-22)
+** https://www.sqlite.org/changes.html#version_3_38_0 */
+#if SQLITE_VERSION_NUMBER >= 3038000
+#define MMR_SUPPORTS_VTAB_IN 1
 #endif
 
 /* ---- Error helper ---------------------------------------------------- */
@@ -260,17 +272,24 @@ static int mmrDestroy(sqlite3_vtab *pVtab) {
 **   'M' = MATCH query
 **   'K' = k (result count)
 **   'L' = mmr_lambda (diversity parameter)
+**   'R' = rowid IN (...), all of its values in one argument
 **
 ** MATCH + k are required.  mmr_lambda is optional (default 1.0).
+** rowid IN (...) is optional and taken all at once through sqlite3_vtab_in(),
+** as vec0 takes it for a KNN query (https://github.com/asg017/sqlite-vec,
+** vec0BestIndex and vec0Filter_knn): one such constraint per query, its
+** values sorted in xFilter and each candidate's rowid binary-searched
+** before the candidate counts toward k.
 */
 
-#define MMR_IDXSTR_KIND_MATCH  'M'
-#define MMR_IDXSTR_KIND_K      'K'
-#define MMR_IDXSTR_KIND_LAMBDA 'L'
+#define MMR_IDXSTR_KIND_MATCH    'M'
+#define MMR_IDXSTR_KIND_K        'K'
+#define MMR_IDXSTR_KIND_LAMBDA   'L'
+#define MMR_IDXSTR_KIND_ROWID_IN 'R'
 
 static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
-  int iMatch = -1, iK = -1, iLambda = -1;
+  int iMatch = -1, iK = -1, iLambda = -1, iRowidIn = -1;
 
   for (int i = 0; i < pInfo->nConstraint; i++) {
     if (!pInfo->aConstraint[i].usable)
@@ -285,6 +304,18 @@ static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     } else if (col == 3 && op == SQLITE_INDEX_CONSTRAINT_EQ) {
       iLambda = i;
     }
+#if MMR_SUPPORTS_VTAB_IN
+    else if (col == -1 && op == SQLITE_INDEX_CONSTRAINT_EQ &&
+             sqlite3_libversion_number() >= 3038000 &&
+             sqlite3_vtab_in(pInfo, i, -1)) {
+      if (iRowidIn >= 0) {
+        vtab_set_error(pVtab,
+            "mmr: only one rowid IN (...) constraint is allowed per query");
+        return SQLITE_ERROR;
+      }
+      iRowidIn = i;
+    }
+#endif
   }
 
   if (iMatch < 0 || iK < 0) {
@@ -312,6 +343,16 @@ static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     pInfo->aConstraintUsage[iLambda].argvIndex = argvIndex++;
     pInfo->aConstraintUsage[iLambda].omit = 1;
   }
+
+#if MMR_SUPPORTS_VTAB_IN
+  if (iRowidIn >= 0) {
+    sqlite3_vtab_in(pInfo, iRowidIn, 1);
+    sqlite3_str_appendchar(idxStr, 1, MMR_IDXSTR_KIND_ROWID_IN);
+    sqlite3_str_appendchar(idxStr, 3, '_');
+    pInfo->aConstraintUsage[iRowidIn].argvIndex = argvIndex++;
+    pInfo->aConstraintUsage[iRowidIn].omit = 1;
+  }
+#endif
 
   pInfo->idxStr = sqlite3_str_finish(idxStr);
   pInfo->needToFreeIdxStr = 1;
@@ -343,6 +384,12 @@ static int mmrClose(sqlite3_vtab_cursor *pCur) {
 
 /* ---- xFilter (main query logic) -------------------------------------- */
 
+static int cmp_rowid(const void *a, const void *b) {
+  sqlite3_int64 x = *(const sqlite3_int64 *)a;
+  sqlite3_int64 y = *(const sqlite3_int64 *)b;
+  return (x > y) - (x < y);
+}
+
 static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
                       const char *idxStr, int argc, sqlite3_value **argv) {
   (void)idxNum;
@@ -361,6 +408,7 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   const char *match_text = NULL;
   int k = 10;
   double mmr_lambda = 1.0;
+  sqlite3_value *rowid_in = NULL;
 
   for (int i = 0; i < argc; i++) {
     char kind = idxStr[i * 4];
@@ -375,6 +423,9 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
       break;
     case MMR_IDXSTR_KIND_LAMBDA:
       mmr_lambda = sqlite3_value_double(argv[i]);
+      break;
+    case MMR_IDXSTR_KIND_ROWID_IN:
+      rowid_in = argv[i];
       break;
     }
   }
@@ -391,19 +442,57 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
                       : k * MMR_OVERFETCH_FACTOR;
 
   int rc = SQLITE_OK;
+  sqlite3_int64 *rowids = NULL;
+  sqlite3_int64 n_rowids = 0;
   sqlite3_stmt *stmt = NULL;
   mmr_row *rows = NULL;
   int n = 0;
   double *relevance = NULL;
   int *order = NULL;
 
-  /* Prepare internal query against source table */
+  /* Collect the rowid IN (...) values; a NULL among them matches no row */
+  if (rowid_in) {
+#if MMR_SUPPORTS_VTAB_IN
+    sqlite3_int64 cap_rowids = 0;
+    sqlite3_value *item;
+    for (rc = sqlite3_vtab_in_first(rowid_in, &item); rc == SQLITE_OK && item;
+         rc = sqlite3_vtab_in_next(rowid_in, &item)) {
+      if (sqlite3_value_type(item) == SQLITE_NULL)
+        continue;
+      if (n_rowids >= cap_rowids) {
+        cap_rowids = cap_rowids ? cap_rowids * 2 : 64;
+        sqlite3_int64 *p = sqlite3_realloc64(
+            rowids, (sqlite3_uint64)cap_rowids * sizeof(sqlite3_int64));
+        if (!p) {
+          rc = SQLITE_NOMEM;
+          goto cleanup;
+        }
+        rowids = p;
+      }
+      rowids[n_rowids++] = sqlite3_value_int64(item);
+    }
+    if (rc != SQLITE_OK && rc != SQLITE_DONE) {
+      vtab_set_error(&vtab->base, "mmr: reading the rowid IN (...) values failed");
+      goto cleanup;
+    }
+    rc = SQLITE_OK;
+#endif
+    if (n_rowids == 0)
+      goto cleanup;
+    qsort(rowids, (size_t)n_rowids, sizeof(sqlite3_int64), cmp_rowid);
+  }
+
+  /*
+  ** Candidates come from the source in rank order.  With a rowid set the
+  ** source query is unlimited (LIMIT -1) and candidates outside the set are
+  ** skipped, so the fetch_limit kept are the best ranked inside the set.
+  */
   char *sql = sqlite3_mprintf(
       "SELECT rowid, %s, %s "
       "FROM \"%w\" WHERE \"%w\" MATCH ?1 ORDER BY %s LIMIT %d",
       vtab->rank_expr, vtab->text_expr,
       vtab->source_table, vtab->source_table,
-      vtab->rank_expr, fetch_limit);
+      vtab->rank_expr, rowids ? -1 : fetch_limit);
   if (!sql) {
     rc = SQLITE_NOMEM;
     goto cleanup;
@@ -421,6 +510,10 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   /* Fetch the candidates, growing the array with them up to fetch_limit */
   int cap = 0;
   while (n < fetch_limit && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    sqlite3_int64 rowid = sqlite3_column_int64(stmt, 0);
+    if (rowids && !bsearch(&rowid, rowids, (size_t)n_rowids,
+                           sizeof(sqlite3_int64), cmp_rowid))
+      continue;
     if (n == cap) {
       cap = cap > fetch_limit / 2 ? fetch_limit : (cap ? cap * 2 : 64);
       if (cap > fetch_limit)
@@ -433,7 +526,7 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
       }
       rows = p;
     }
-    rows[n].rowid = sqlite3_column_int64(stmt, 0);
+    rows[n].rowid = rowid;
     rows[n].rank_value = sqlite3_column_double(stmt, 1);
     const char *txt = (const char *)sqlite3_column_text(stmt, 2);
     rows[n].text = sqlite3_mprintf("%s", txt ? txt : "");
@@ -568,6 +661,7 @@ cleanup:
   sqlite3_finalize(stmt);
   sqlite3_free(order);
   sqlite3_free(relevance);
+  sqlite3_free(rowids);
   for (int i = 0; i < n; i++)
     mmr_row_free(&rows[i]);
   sqlite3_free(rows);

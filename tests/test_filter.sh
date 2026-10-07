@@ -1,7 +1,8 @@
 #!/bin/sh
 #
 # xFilter's contract, run against the built extension: an error from the source
-# query fails the mmr query instead of ending its rows.
+# query fails the mmr query instead of ending its rows, and a rowid IN (...)
+# constraint restricts the candidates before the top k are taken.
 #
 # Usage: sh tests/test_filter.sh
 
@@ -52,6 +53,25 @@ eq "an error partway through the source's rows fails the query" \
 	"$(session "CREATE VIRTUAL TABLE bad_mmr USING mmr(docs, CASE WHEN rowid = 3 THEN abs(-9223372036854775808) ELSE body END, rank);
 	SELECT count(*) FROM bad_mmr WHERE text MATCH 'cat' AND k = 6;")" \
 	"$(session "SELECT abs(-9223372036854775808);")"
+
+# The top k are taken inside the set, not filtered out of the top k overall.
+eq "rowid IN (list) keeps the best ranked rows inside the set" \
+	"$(ids "SELECT rowid FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (3, 4, 5, 6)")" "3,4"
+eq "rowid IN (subquery) keeps the best ranked rows inside the set" \
+	"$(ids "SELECT rowid FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (SELECT rowid FROM docs WHERE rowid > 2)")" "3,4"
+eq "rowid IN under MMR returns k rows, all inside the set" \
+	"$(session "SELECT count(*) || '|' || min(rowid) FROM (SELECT rowid FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND mmr_lambda = 0.5 AND rowid IN (3, 4, 5, 6));")" \
+	"2|3"
+eq "a NULL in rowid IN (...) matches no row, not rowid 0" \
+	"$(session "INSERT INTO docs(rowid, body) VALUES (0, 'cat cat cat cat cat cat');
+	SELECT ifnull(group_concat(rowid), '') FROM (SELECT rowid FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (SELECT NULL UNION ALL SELECT 5));")" \
+	"5"
+eq "an empty rowid IN (...) returns no rows" \
+	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (SELECT rowid FROM docs WHERE 0);")" \
+	"0"
+eq "a second rowid IN (...) is refused" \
+	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (1, 2, 3) AND rowid IN (2, 3, 4);" | grep -c 'only one rowid IN')" \
+	"1"
 
 echo "# filter: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -94,6 +94,22 @@ source table (e.g. `match_tokens` requires the source to be an `fts5x` table).
 An error from this query, such as a MATCH the source rejects, fails the `mmr`
 query with the source's message.
 
+A `rowid IN (...)` constraint, over a list or a subquery, restricts the
+candidates to those source rowids before the top `k` are taken, so the query
+returns the best ranked rows inside the set rather than the members of the
+overall top `k`:
+
+```sql
+SELECT rowid, text FROM docs_mmr
+  WHERE text MATCH 'cat' AND k = 5
+    AND rowid IN (SELECT id FROM docs_meta WHERE lang = 'en');
+```
+
+The source query then runs without its `LIMIT`, and rows outside the set are
+skipped until the overfetch count is reached. One `rowid IN` constraint is
+allowed per query; it needs SQLite 3.38 or newer, which added
+[`sqlite3_vtab_in()`](https://www.sqlite.org/c3ref/vtab_in.html).
+
 | Query column | Type | Hidden | Description |
 |--------------|------|--------|-------------|
 | `rank` | REAL | yes | Relevance score from `rank_expr` |
@@ -111,7 +127,8 @@ query with the source's message.
 
 When `mmr_lambda < 1.0`:
 
-1. Overfetch `k * 5` candidates from the source table (top by `rank_expr`)
+1. Overfetch `k * 5` candidates from the source table (top by `rank_expr`,
+   inside the `rowid IN` set when there is one)
 2. Split each `text_expr` result on whitespace into a token set
 3. Normalize ranks to relevance scores in `[0, 1]` (min-max, best rank maps to `1.0`)
 4. Greedy selection loop picks the candidate maximizing
