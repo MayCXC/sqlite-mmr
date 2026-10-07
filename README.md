@@ -91,6 +91,8 @@ SELECT rowid, <rank_expr>, <text_expr>
 
 so any function used in `text_expr` or `rank_expr` must be callable on the
 source table (e.g. `match_tokens` requires the source to be an `fts5x` table).
+An error from this query, such as a MATCH the source rejects, fails the `mmr`
+query with the source's message.
 
 | Query column | Type | Hidden | Description |
 |--------------|------|--------|-------------|
@@ -124,7 +126,7 @@ When `mmr_lambda >= 1.0`: no reranking, returns the top `k` by rank directly.
 
 ```sh
 make            # builds mmr0.so (or mmr0.dylib on macOS)
-make test       # runs smoke tests
+make test       # runs the smoke tests and tests/test_filter.sh
 make install    # installs to /usr/local/lib and /usr/local/include
 ```
 

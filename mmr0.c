@@ -387,6 +387,13 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   if (fetch_limit < k)
     fetch_limit = k;
 
+  int rc = SQLITE_OK;
+  sqlite3_stmt *stmt = NULL;
+  mmr_row *rows = NULL;
+  int n = 0;
+  double *relevance = NULL;
+  int *order = NULL;
+
   /* Prepare internal query against source table */
   char *sql = sqlite3_mprintf(
       "SELECT rowid, %s, %s "
@@ -394,38 +401,32 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
       vtab->rank_expr, vtab->text_expr,
       vtab->source_table, vtab->source_table,
       vtab->rank_expr, fetch_limit);
-  if (!sql)
-    return SQLITE_NOMEM;
+  if (!sql) {
+    rc = SQLITE_NOMEM;
+    goto cleanup;
+  }
 
-  sqlite3_stmt *stmt = NULL;
-  int rc = sqlite3_prepare_v2(vtab->db, sql, -1, &stmt, NULL);
+  rc = sqlite3_prepare_v2(vtab->db, sql, -1, &stmt, NULL);
   sqlite3_free(sql);
+  if (rc == SQLITE_OK)
+    rc = sqlite3_bind_text(stmt, 1, match_text, -1, SQLITE_TRANSIENT);
   if (rc != SQLITE_OK) {
     vtab_set_error(&vtab->base, "%s", sqlite3_errmsg(vtab->db));
-    return rc;
+    goto cleanup;
   }
 
-  sqlite3_bind_text(stmt, 1, match_text, -1, SQLITE_TRANSIENT);
-
-  /* Fetch all candidates */
-  int cap = fetch_limit > 0 ? fetch_limit : 64;
-  mmr_row *rows = sqlite3_malloc(cap * sizeof(mmr_row));
-  if (!rows) {
-    sqlite3_finalize(stmt);
-    return SQLITE_NOMEM;
-  }
-  int n = 0;
-
-  while (sqlite3_step(stmt) == SQLITE_ROW) {
-    if (n >= cap) {
-      cap *= 2;
-      mmr_row *p = sqlite3_realloc(rows, cap * sizeof(mmr_row));
+  /* Fetch the candidates, growing the array with them up to fetch_limit */
+  int cap = 0;
+  while (n < fetch_limit && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    if (n == cap) {
+      cap = cap > fetch_limit / 2 ? fetch_limit : (cap ? cap * 2 : 64);
+      if (cap > fetch_limit)
+        cap = fetch_limit;
+      mmr_row *p =
+          sqlite3_realloc64(rows, (sqlite3_uint64)cap * sizeof(mmr_row));
       if (!p) {
-        for (int i = 0; i < n; i++)
-          mmr_row_free(&rows[i]);
-        sqlite3_free(rows);
-        sqlite3_finalize(stmt);
-        return SQLITE_NOMEM;
+        rc = SQLITE_NOMEM;
+        goto cleanup;
       }
       rows = p;
     }
@@ -436,32 +437,30 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
     mmr_tokenset_init(&rows[n].tokens);
     rows[n].selected = 0;
     if (!rows[n].text) {
-      for (int i = 0; i < n; i++)
-        mmr_row_free(&rows[i]);
-      sqlite3_free(rows);
-      sqlite3_finalize(stmt);
-      return SQLITE_NOMEM;
+      rc = SQLITE_NOMEM;
+      goto cleanup;
     }
     n++;
   }
-  sqlite3_finalize(stmt);
-
-  if (n == 0) {
-    sqlite3_free(rows);
-    return SQLITE_OK;
+  /* The loop also exits on an error, which fails the query */
+  if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+    vtab_set_error(&vtab->base, "%s", sqlite3_errmsg(vtab->db));
+    goto cleanup;
   }
+  rc = SQLITE_OK;
+  sqlite3_finalize(stmt);
+  stmt = NULL;
+
+  if (n == 0)
+    goto cleanup;
 
   /* ---- MMR reranking --------------------------------------------------- */
   if (mmr_lambda < 1.0 && n > 1) {
     /* Tokenize all text */
     for (int i = 0; i < n; i++) {
       rc = mmr_tokenset_split(&rows[i].tokens, rows[i].text);
-      if (rc != SQLITE_OK) {
-        for (int j = 0; j < n; j++)
-          mmr_row_free(&rows[j]);
-        sqlite3_free(rows);
-        return rc;
-      }
+      if (rc != SQLITE_OK)
+        goto cleanup;
     }
 
     /*
@@ -479,12 +478,10 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
     }
     double range = max_rank - min_rank;
 
-    double *relevance = sqlite3_malloc(n * sizeof(double));
+    relevance = sqlite3_malloc(n * sizeof(double));
     if (!relevance) {
-      for (int i = 0; i < n; i++)
-        mmr_row_free(&rows[i]);
-      sqlite3_free(rows);
-      return SQLITE_NOMEM;
+      rc = SQLITE_NOMEM;
+      goto cleanup;
     }
     for (int i = 0; i < n; i++) {
       relevance[i] =
@@ -493,13 +490,10 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
 
     /* Greedy MMR selection */
     int actual_k = k < n ? k : n;
-    int *order = sqlite3_malloc(actual_k * sizeof(int));
+    order = sqlite3_malloc(actual_k * sizeof(int));
     if (!order) {
-      sqlite3_free(relevance);
-      for (int i = 0; i < n; i++)
-        mmr_row_free(&rows[i]);
-      sqlite3_free(rows);
-      return SQLITE_NOMEM;
+      rc = SQLITE_NOMEM;
+      goto cleanup;
     }
 
     int selected_count = 0;
@@ -538,12 +532,8 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
     /* Compact: reorder rows[] to selected order */
     mmr_row *reordered = sqlite3_malloc(selected_count * sizeof(mmr_row));
     if (!reordered) {
-      sqlite3_free(order);
-      sqlite3_free(relevance);
-      for (int i = 0; i < n; i++)
-        mmr_row_free(&rows[i]);
-      sqlite3_free(rows);
-      return SQLITE_NOMEM;
+      rc = SQLITE_NOMEM;
+      goto cleanup;
     }
     for (int i = 0; i < selected_count; i++)
       reordered[i] = rows[order[i]];
@@ -554,8 +544,6 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
         mmr_row_free(&rows[i]);
     }
     sqlite3_free(rows);
-    sqlite3_free(order);
-    sqlite3_free(relevance);
     rows = reordered;
     n = selected_count;
   } else {
@@ -570,7 +558,17 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   cur->rows = rows;
   cur->n_rows = n;
   cur->current = 0;
-  return SQLITE_OK;
+  rows = NULL;
+  n = 0;
+
+cleanup:
+  sqlite3_finalize(stmt);
+  sqlite3_free(order);
+  sqlite3_free(relevance);
+  for (int i = 0; i < n; i++)
+    mmr_row_free(&rows[i]);
+  sqlite3_free(rows);
+  return rc;
 }
 
 /* ---- Cursor navigation ----------------------------------------------- */

@@ -24,7 +24,8 @@ install: $(TARGET_LOADABLE) mmr0.h
 	install -m 644 mmr0.h $(INSTALL_INCLUDE_DIR)
 
 test: $(TARGET_LOADABLE)
-	sqlite3 :memory: '.load ./mmr0' '.read tests/test_basic.sql'
+	sqlite3 -bail :memory: '.load ./mmr0' '.read tests/test_basic.sql'
+	sh tests/test_filter.sh
 
 clean:
 	rm -f $(TARGET_LOADABLE) mmr0.o
