@@ -399,6 +399,33 @@ static int cmp_rowid(const void *a, const void *b) {
   return (x > y) - (x < y);
 }
 
+/*
+** The rowid a value equals, compared as SQLite compares it: the rowid has
+** INTEGER affinity, so the value takes numeric affinity first
+** (https://www.sqlite.org/datatype3.html#comparison_expressions), and then
+** only an INTEGER, or a REAL without a fraction inside sqlite3_int64's range,
+** equals one.  Returns 0 for any other value, NULL included.
+*/
+static int mmr_value_as_rowid(sqlite3_value *v, sqlite3_int64 *rowid) {
+  switch (sqlite3_value_numeric_type(v)) {
+  case SQLITE_INTEGER:
+    *rowid = sqlite3_value_int64(v);
+    return 1;
+  case SQLITE_FLOAT: {
+    double r = sqlite3_value_double(v);
+    if (r < -9223372036854775808.0 || r >= 9223372036854775808.0)
+      return 0;
+    sqlite3_int64 y = (sqlite3_int64)r;
+    if ((double)y != r)
+      return 0;
+    *rowid = y;
+    return 1;
+  }
+  default:
+    return 0;
+  }
+}
+
 static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
                       const char *idxStr, int argc, sqlite3_value **argv) {
   (void)idxNum;
@@ -460,14 +487,15 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   double *max_sim = NULL;
   int *order = NULL;
 
-  /* Collect the rowid IN (...) values; a NULL among them matches no row */
+  /* Collect the rowid IN (...) values that equal a rowid */
   if (rowid_in) {
 #if MMR_SUPPORTS_VTAB_IN
     sqlite3_int64 cap_rowids = 0;
     sqlite3_value *item;
     for (rc = sqlite3_vtab_in_first(rowid_in, &item); rc == SQLITE_OK && item;
          rc = sqlite3_vtab_in_next(rowid_in, &item)) {
-      if (sqlite3_value_type(item) == SQLITE_NULL)
+      sqlite3_int64 rowid;
+      if (!mmr_value_as_rowid(item, &rowid))
         continue;
       if (n_rowids >= cap_rowids) {
         cap_rowids = cap_rowids ? cap_rowids * 2 : 64;
@@ -479,7 +507,7 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
         }
         rowids = p;
       }
-      rowids[n_rowids++] = sqlite3_value_int64(item);
+      rowids[n_rowids++] = rowid;
     }
     if (rc != SQLITE_OK && rc != SQLITE_DONE) {
       vtab_set_error(&vtab->base, "mmr: reading the rowid IN (...) values failed");

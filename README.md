@@ -105,6 +105,9 @@ SELECT rowid, text FROM docs_mmr
     AND rowid IN (SELECT id FROM docs_meta WHERE lang = 'en');
 ```
 
+Each value compares with a rowid as SQLite compares it, with numeric affinity:
+`'5'` and `5.0` match rowid 5, while `NULL`, `'abc'` and `5.5` match none.
+
 The source query then runs without its `LIMIT`, and rows outside the set are
 skipped until the overfetch count is reached. One `rowid IN` constraint is
 allowed per query; it needs SQLite 3.38 or newer, which added

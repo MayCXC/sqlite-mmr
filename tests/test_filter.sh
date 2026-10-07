@@ -66,6 +66,11 @@ eq "a NULL in rowid IN (...) matches no row, not rowid 0" \
 	"$(session "INSERT INTO docs(rowid, body) VALUES (0, 'cat cat cat cat cat cat');
 	SELECT ifnull(group_concat(rowid), '') FROM (SELECT rowid FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (SELECT NULL UNION ALL SELECT 5));")" \
 	"5"
+eq "rowid IN (...) compares as SQLite compares with an integer primary key" \
+	"$(session "INSERT INTO docs(rowid, body) VALUES (0, 'cat cat cat cat cat cat');
+	SELECT ifnull(group_concat(rowid), '') FROM (SELECT rowid FROM docs_mmr WHERE text MATCH 'cat' AND k = 7 AND rowid IN ('2', 3.0, 'abc', 4.5, x'05', 1e19) ORDER BY rowid);")" \
+	"$(session "CREATE TABLE p(id INTEGER PRIMARY KEY); INSERT INTO p VALUES (0), (1), (2), (3), (4), (5), (6);
+	SELECT ifnull(group_concat(id), '') FROM (SELECT id FROM p WHERE id IN ('2', 3.0, 'abc', 4.5, x'05', 1e19) ORDER BY id);")"
 eq "an empty rowid IN (...) returns no rows" \
 	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (SELECT rowid FROM docs WHERE 0);")" \
 	"0"
