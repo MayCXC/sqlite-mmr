@@ -142,12 +142,11 @@ static void mmr_tokenset_sort_dedup(mmr_tokenset *ts) {
 }
 
 /*
-** Jaccard similarity between two token sets.
-** Sorts and deduplicates both inputs, then computes via sorted merge.
+** Jaccard similarity between two sorted, deduplicated token sets, computed
+** by a sorted merge.
 */
-static double mmr_jaccard(mmr_tokenset *a, mmr_tokenset *b) {
-  mmr_tokenset_sort_dedup(a);
-  mmr_tokenset_sort_dedup(b);
+static double mmr_jaccard_sorted(const mmr_tokenset *a,
+                                 const mmr_tokenset *b) {
   if (a->n == 0 && b->n == 0)
     return 0.0;
   int i = 0, j = 0, inter = 0;
@@ -165,6 +164,16 @@ static double mmr_jaccard(mmr_tokenset *a, mmr_tokenset *b) {
   }
   int uni = a->n + b->n - inter;
   return uni > 0 ? (double)inter / (double)uni : 0.0;
+}
+
+/*
+** Jaccard similarity between two token sets.
+** Sorts and deduplicates both inputs, then computes via sorted merge.
+*/
+static double mmr_jaccard(mmr_tokenset *a, mmr_tokenset *b) {
+  mmr_tokenset_sort_dedup(a);
+  mmr_tokenset_sort_dedup(b);
+  return mmr_jaccard_sorted(a, b);
 }
 
 /* ---- Row buffer ------------------------------------------------------- */
@@ -448,6 +457,7 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   mmr_row *rows = NULL;
   int n = 0;
   double *relevance = NULL;
+  double *max_sim = NULL;
   int *order = NULL;
 
   /* Collect the rowid IN (...) values; a NULL among them matches no row */
@@ -552,11 +562,12 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   /* ---- MMR reranking --------------------------------------------------- */
   if (mmr_lambda < 1.0 && n > 1) {
-    /* Tokenize all text */
+    /* Tokenize all text into sorted, deduplicated sets */
     for (int i = 0; i < n; i++) {
       rc = mmr_tokenset_split(&rows[i].tokens, rows[i].text);
       if (rc != SQLITE_OK)
         goto cleanup;
+      mmr_tokenset_sort_dedup(&rows[i].tokens);
     }
 
     /*
@@ -584,13 +595,21 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
           (range > 0.0) ? (max_rank - rows[i].rank_value) / range : 1.0;
     }
 
-    /* Greedy MMR selection */
+    /*
+    ** Greedy MMR selection.  max_sim[i] is row i's highest Jaccard
+    ** similarity to the rows selected so far, raised against each new pick
+    ** alone, so a step compares each remaining row once rather than with
+    ** every selected row.
+    */
     int actual_k = k < n ? k : n;
     order = sqlite3_malloc(actual_k * sizeof(int));
-    if (!order) {
+    max_sim = sqlite3_malloc(n * sizeof(double));
+    if (!order || !max_sim) {
       rc = SQLITE_NOMEM;
       goto cleanup;
     }
+    for (int i = 0; i < n; i++)
+      max_sim[i] = 0.0;
 
     int selected_count = 0;
     for (int step = 0; step < actual_k; step++) {
@@ -601,17 +620,8 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
         if (rows[i].selected)
           continue;
 
-        /* max Jaccard similarity to any already-selected row */
-        double max_sim = 0.0;
-        for (int s = 0; s < selected_count; s++) {
-          double sim =
-              mmr_jaccard(&rows[i].tokens, &rows[order[s]].tokens);
-          if (sim > max_sim)
-            max_sim = sim;
-        }
-
         double mmr_score =
-            mmr_lambda * relevance[i] - (1.0 - mmr_lambda) * max_sim;
+            mmr_lambda * relevance[i] - (1.0 - mmr_lambda) * max_sim[i];
 
         if (mmr_score > best_score) {
           best_score = mmr_score;
@@ -623,6 +633,15 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
         break;
       rows[best_idx].selected = 1;
       order[selected_count++] = best_idx;
+
+      for (int i = 0; i < n; i++) {
+        if (rows[i].selected)
+          continue;
+        double sim =
+            mmr_jaccard_sorted(&rows[i].tokens, &rows[best_idx].tokens);
+        if (sim > max_sim[i])
+          max_sim[i] = sim;
+      }
     }
 
     /* Compact: reorder rows[] to selected order */
@@ -660,6 +679,7 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
 cleanup:
   sqlite3_finalize(stmt);
   sqlite3_free(order);
+  sqlite3_free(max_sim);
   sqlite3_free(relevance);
   sqlite3_free(rowids);
   for (int i = 0; i < n; i++)
