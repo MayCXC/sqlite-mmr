@@ -113,9 +113,21 @@ skipped until the overfetch count is reached. One `rowid IN` constraint is
 allowed per query; it needs SQLite 3.38 or newer, which added
 [`sqlite3_vtab_in()`](https://www.sqlite.org/c3ref/vtab_in.html).
 
+A `rank MATCH` constraint is passed to the source query as its own
+(`... MATCH ?1 AND rank MATCH ?2 ...`), so an FTS5 source ranks the candidates
+by the function it names for that query, as FTS5 takes
+[`rank MATCH`](https://www.sqlite.org/fts5.html#sorting_by_auxiliary_function_results).
+It changes the order when `rank_expr` reads the source's `rank`, as the
+`docs_mmr` above does:
+
+```sql
+SELECT rowid, rank, text FROM docs_mmr
+  WHERE text MATCH 'cat' AND k = 5 AND rank MATCH 'bm25(10.0, 1.0)';
+```
+
 | Query column | Type | Hidden | Description |
 |--------------|------|--------|-------------|
-| `rank` | REAL | yes | Relevance score from `rank_expr` |
+| `rank` | REAL | yes | Relevance score from `rank_expr`; `rank MATCH` sets the source's ranking function |
 | `text` | TEXT | no | Result of `text_expr` |
 | `k` | INT | yes | Number of results to return (required) |
 | `mmr_lambda` | REAL | yes | `1.0` = pure relevance, `0.5` = balanced, `0.0` = pure diversity (default `1.0`) |

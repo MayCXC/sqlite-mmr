@@ -78,5 +78,35 @@ eq "a second rowid IN (...) is refused" \
 	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (1, 2, 3) AND rowid IN (2, 3, 4);" | grep -c 'only one rowid IN')" \
 	"1"
 
+# Two columns, so bm25's column weights change the order: rowid 1 has "cat" once
+# in its title, rowid 2 three times in its body, every row four tokens long, and
+# the "bird" rows keep "cat"'s IDF positive. Unweighted, rowid 2 ranks first;
+# with the title weighted 10, rowid 1 does.
+PETS="CREATE VIRTUAL TABLE pets USING fts5(title, body);
+INSERT INTO pets(rowid, title, body) VALUES
+  (1, 'cat', 'dog dog dog'), (2, 'dog', 'cat cat cat'),
+  (3, 'bird', 'dog dog dog'), (4, 'bird', 'dog dog dog'), (5, 'bird', 'dog dog dog');
+CREATE VIRTUAL TABLE pets_mmr USING mmr(pets, body, rank);"
+pets() { session "$PETS $1"; }
+pet_ids() { pets "SELECT ifnull(group_concat(rowid), '') FROM ($1);"; }
+
+eq "fixture: unweighted, FTS5 ranks rowid 2 before rowid 1" \
+	"$(pet_ids "SELECT rowid FROM pets WHERE pets MATCH 'cat' ORDER BY rank")" "2,1"
+eq "rank MATCH reaches the source and reorders the candidates" \
+	"$(pet_ids "SELECT rowid FROM pets_mmr WHERE text MATCH 'cat' AND k = 2 AND rank MATCH 'bm25(10.0, 1.0)'")" \
+	"$(pet_ids "SELECT rowid FROM pets WHERE pets MATCH 'cat' AND rank MATCH 'bm25(10.0, 1.0)' ORDER BY rank")"
+eq "rank MATCH gives the order the weights call for" \
+	"$(pet_ids "SELECT rowid FROM pets_mmr WHERE text MATCH 'cat' AND k = 2 AND rank MATCH 'bm25(10.0, 1.0)'")" "1,2"
+eq "the rank column under rank MATCH is the source's rank under it" \
+	"$(pets "SELECT group_concat(rowid || ':' || printf('%.12f', rank)) FROM (SELECT rowid, rank FROM pets_mmr WHERE text MATCH 'cat' AND k = 2 AND rank MATCH 'bm25(10.0, 1.0)');")" \
+	"$(pets "SELECT group_concat(rowid || ':' || printf('%.12f', rank)) FROM (SELECT rowid, rank FROM pets WHERE pets MATCH 'cat' AND rank MATCH 'bm25(10.0, 1.0)' ORDER BY rank);")"
+eq "rank MATCH and rowid IN (...) together" \
+	"$(pet_ids "SELECT rowid FROM pets_mmr WHERE text MATCH 'cat' AND k = 2 AND rank MATCH 'bm25(10.0, 1.0)' AND rowid IN (2, 1)")" "1,2"
+# FTS5 looks the rank function up only when the rank is used, so the reference
+# orders by it, as mmr's source query does.
+eq "a rank function the source rejects fails the query with the source's error" \
+	"$(pets "SELECT count(*) FROM pets_mmr WHERE text MATCH 'cat' AND k = 2 AND rank MATCH 'nosuchfn()';")" \
+	"$(pets "SELECT count(*) FROM (SELECT rowid FROM pets WHERE pets MATCH 'cat' AND rank MATCH 'nosuchfn()' ORDER BY rank);")"
+
 echo "# filter: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

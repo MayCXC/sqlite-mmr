@@ -20,6 +20,13 @@
 ** SELECT rowid, rank, text FROM t_mmr
 **   WHERE text MATCH :q AND k = :k AND rowid IN (SELECT ...);
 **
+** A rank MATCH constraint is passed to the source query as its own, so an
+** FTS5 source ranks the candidates by the function it names, as FTS5 takes
+** rank MATCH (https://www.sqlite.org/fts5.html#sorting_by_auxiliary_function_results):
+**
+** SELECT rowid, rank, text FROM t_mmr
+**   WHERE text MATCH :q AND k = :k AND rank MATCH 'bm25(10.0, 1.0)';
+**
 ** BSD 3-Clause License. See LICENSE for details.
 */
 
@@ -282,8 +289,10 @@ static int mmrDestroy(sqlite3_vtab *pVtab) {
 **   'K' = k (result count)
 **   'L' = mmr_lambda (diversity parameter)
 **   'R' = rowid IN (...), all of its values in one argument
+**   'F' = rank MATCH, the source's ranking function
 **
-** MATCH + k are required.  mmr_lambda is optional (default 1.0).
+** MATCH + k are required.  mmr_lambda is optional (default 1.0), and so is
+** rank MATCH (default: the source's own rank).
 ** rowid IN (...) is optional and taken all at once through sqlite3_vtab_in(),
 ** as vec0 takes it for a KNN query (https://github.com/asg017/sqlite-vec,
 ** vec0BestIndex and vec0Filter_knn): one such constraint per query, its
@@ -295,10 +304,11 @@ static int mmrDestroy(sqlite3_vtab *pVtab) {
 #define MMR_IDXSTR_KIND_K        'K'
 #define MMR_IDXSTR_KIND_LAMBDA   'L'
 #define MMR_IDXSTR_KIND_ROWID_IN 'R'
+#define MMR_IDXSTR_KIND_RANK     'F'
 
 static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
-  int iMatch = -1, iK = -1, iLambda = -1, iRowidIn = -1;
+  int iMatch = -1, iK = -1, iLambda = -1, iRowidIn = -1, iRank = -1;
 
   for (int i = 0; i < pInfo->nConstraint; i++) {
     if (!pInfo->aConstraint[i].usable)
@@ -308,6 +318,8 @@ static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
 
     if (op == SQLITE_INDEX_CONSTRAINT_MATCH && (col == 1 || col == -1)) {
       iMatch = i;
+    } else if (op == SQLITE_INDEX_CONSTRAINT_MATCH && col == 0 && iRank < 0) {
+      iRank = i;
     } else if (col == 2 && op == SQLITE_INDEX_CONSTRAINT_EQ) {
       iK = i;
     } else if (col == 3 && op == SQLITE_INDEX_CONSTRAINT_EQ) {
@@ -351,6 +363,13 @@ static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     sqlite3_str_appendchar(idxStr, 3, '_');
     pInfo->aConstraintUsage[iLambda].argvIndex = argvIndex++;
     pInfo->aConstraintUsage[iLambda].omit = 1;
+  }
+
+  if (iRank >= 0) {
+    sqlite3_str_appendchar(idxStr, 1, MMR_IDXSTR_KIND_RANK);
+    sqlite3_str_appendchar(idxStr, 3, '_');
+    pInfo->aConstraintUsage[iRank].argvIndex = argvIndex++;
+    pInfo->aConstraintUsage[iRank].omit = 1;
   }
 
 #if MMR_SUPPORTS_VTAB_IN
@@ -445,6 +464,7 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   int k = 10;
   double mmr_lambda = 1.0;
   sqlite3_value *rowid_in = NULL;
+  sqlite3_value *rank_fn = NULL;
 
   for (int i = 0; i < argc; i++) {
     char kind = idxStr[i * 4];
@@ -462,6 +482,9 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
       break;
     case MMR_IDXSTR_KIND_ROWID_IN:
       rowid_in = argv[i];
+      break;
+    case MMR_IDXSTR_KIND_RANK:
+      rank_fn = argv[i];
       break;
     }
   }
@@ -527,9 +550,10 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   */
   char *sql = sqlite3_mprintf(
       "SELECT rowid, %s, %s "
-      "FROM \"%w\" WHERE \"%w\" MATCH ?1 ORDER BY %s LIMIT %d",
+      "FROM \"%w\" WHERE \"%w\" MATCH ?1%s ORDER BY %s LIMIT %d",
       vtab->rank_expr, vtab->text_expr,
       vtab->source_table, vtab->source_table,
+      rank_fn ? " AND rank MATCH ?2" : "",
       vtab->rank_expr, rowids ? -1 : fetch_limit);
   if (!sql) {
     rc = SQLITE_NOMEM;
@@ -540,6 +564,8 @@ static int mmrFilter(sqlite3_vtab_cursor *pCur, int idxNum,
   sqlite3_free(sql);
   if (rc == SQLITE_OK)
     rc = sqlite3_bind_text(stmt, 1, match_text, -1, SQLITE_TRANSIENT);
+  if (rc == SQLITE_OK && rank_fn)
+    rc = sqlite3_bind_value(stmt, 2, rank_fn);
   if (rc != SQLITE_OK) {
     vtab_set_error(&vtab->base, "%s", sqlite3_errmsg(vtab->db));
     goto cleanup;
