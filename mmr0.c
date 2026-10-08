@@ -811,9 +811,10 @@ static sqlite3_module mmrModule = {
 
 /* ---- jaccard() scalar function --------------------------------------- */
 /*
-** jaccard(a, b) — Jaccard similarity on two text strings.
-** Tokenizes both inputs (lowercase, split), sorts and deduplicates
-** internally, then computes |intersection| / |union|.
+** jaccard(a, b): Jaccard similarity of two whitespace-separated token
+** strings.  Splits both on spaces, sorts and deduplicates each, then
+** computes |intersection| / |union|.  Case-sensitive: it expects
+** already-lowercased tokens, as match_tokens produces.
 */
 static void sql_jaccard(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
