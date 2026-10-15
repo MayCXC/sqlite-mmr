@@ -74,6 +74,10 @@ eq "rowid IN (...) compares as SQLite compares with an integer primary key" \
 eq "an empty rowid IN (...) returns no rows" \
 	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (SELECT rowid FROM docs WHERE 0);")" \
 	"0"
+eq "a rowid IN (...) reading another table keeps, for each of its rows, the best ranked rows inside the set" \
+	"$(session "CREATE TABLE sel(lo INTEGER); INSERT INTO sel VALUES (2), (4);
+	SELECT ifnull(group_concat(x), '') FROM (SELECT s.lo || '>' || m.rowid AS x FROM docs_mmr m, sel s WHERE m.text MATCH 'cat' AND m.k = 2 AND m.rowid IN (SELECT rowid FROM docs WHERE rowid > s.lo) ORDER BY s.lo, m.rowid);")" \
+	"2>3,2>4,4>5,4>6"
 eq "a second rowid IN (...) is refused" \
 	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (1, 2, 3) AND rowid IN (2, 3, 4);" | grep -c 'only one rowid IN')" \
 	"1"

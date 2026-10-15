@@ -113,6 +113,20 @@ skipped until the overfetch count is reached. One `rowid IN` constraint is
 allowed per query; it needs SQLite 3.38 or newer, which added
 [`sqlite3_vtab_in()`](https://www.sqlite.org/c3ref/vtab_in.html).
 
+The set can read another table of the query, so one statement can take each
+row's own top `k`:
+
+```sql
+SELECT u.id, m.rowid FROM users u, docs_mmr m
+  WHERE m.text MATCH 'cat' AND m.k = 5
+    AND m.rowid IN (SELECT id FROM docs_meta WHERE lang = u.lang);
+```
+
+Since the set decides which rows the top `k` come from, the planner is only
+offered plans that pass it to `mmr`: one that would leave it for SQLite to apply
+to the rows afterwards is refused, as `json_each` refuses a plan that cannot
+supply its argument.
+
 A `rank MATCH` constraint is passed to the source query as its own
 (`... MATCH ?1 AND rank MATCH ?2 ...`), so an FTS5 source ranks the candidates
 by the function it names for that query, as FTS5 takes

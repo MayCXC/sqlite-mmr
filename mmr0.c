@@ -298,6 +298,13 @@ static int mmrDestroy(sqlite3_vtab *pVtab) {
 ** vec0BestIndex and vec0Filter_knn): one such constraint per query, its
 ** values sorted in xFilter and each candidate's rowid binary-searched
 ** before the candidate counts toward k.
+**
+** Since the set picks the rows the top k are taken from, it is an argument
+** rather than a filter: SQLite applying it to the rows after the scan would
+** keep only whichever of the overall top k fall inside it. So a plan in which
+** a rowid IN (...) cannot be supplied, as when its subquery reads a table the
+** plan has not reached yet, is refused, the way json_each refuses a plan that
+** cannot supply its argument, and the planner takes one in which it can.
 */
 
 #define MMR_IDXSTR_KIND_MATCH    'M'
@@ -311,10 +318,17 @@ static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   int iMatch = -1, iK = -1, iLambda = -1, iRowidIn = -1, iRank = -1;
 
   for (int i = 0; i < pInfo->nConstraint; i++) {
-    if (!pInfo->aConstraint[i].usable)
-      continue;
     int col = pInfo->aConstraint[i].iColumn;
     int op = pInfo->aConstraint[i].op;
+#if MMR_SUPPORTS_VTAB_IN
+    if (!pInfo->aConstraint[i].usable && col == -1 &&
+        op == SQLITE_INDEX_CONSTRAINT_EQ &&
+        sqlite3_libversion_number() >= 3038000 &&
+        sqlite3_vtab_in(pInfo, i, -1))
+      return SQLITE_CONSTRAINT;
+#endif
+    if (!pInfo->aConstraint[i].usable)
+      continue;
 
     if (op == SQLITE_INDEX_CONSTRAINT_MATCH && (col == 1 || col == -1)) {
       iMatch = i;
