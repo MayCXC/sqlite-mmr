@@ -82,6 +82,30 @@ eq "a second rowid IN (...) is refused" \
 	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat' AND k = 2 AND rowid IN (1, 2, 3) AND rowid IN (2, 3, 4);" | grep -c 'only one rowid IN')" \
 	"1"
 
+# MATCH and k are required arguments (https://www.sqlite.org/vtab.html,
+# "Enforcing Required Parameters On Table-Valued Functions"). The first
+# assertion's statistics make reading docs_mmr before q the cheaper order on
+# paper, an order in which neither argument has its value yet.
+eq "a MATCH taken from another table is supplied where the planner prefers reading docs_mmr first" \
+	"$(session "CREATE TABLE q(term TEXT); INSERT INTO q VALUES ('cat');
+	ANALYZE; UPDATE sqlite_stat1 SET stat = '100000000000' WHERE tbl = 'q'; ANALYZE sqlite_schema;
+	SELECT count(*) FROM docs_mmr m, q WHERE m.text MATCH q.term AND m.k = 2;")" \
+	"2"
+eq "a join that reads the MATCH's table after docs_mmr fails instead of returning no rows" \
+	"$(session "CREATE TABLE q(term TEXT); INSERT INTO q VALUES ('cat');
+	SELECT count(*) FROM docs_mmr m CROSS JOIN q WHERE m.text MATCH q.term AND m.k = 2;" | grep -c 'MATCH and k are required')" \
+	"1"
+eq "a join that reads k's table after docs_mmr fails instead of returning no rows" \
+	"$(session "CREATE TABLE q(n INTEGER); INSERT INTO q VALUES (2);
+	SELECT count(*) FROM docs_mmr m CROSS JOIN q WHERE m.text MATCH 'cat' AND m.k = q.n;" | grep -c 'MATCH and k are required')" \
+	"1"
+eq "a query without MATCH fails" \
+	"$(session "SELECT count(*) FROM docs_mmr WHERE k = 2;" | grep -c 'MATCH and k are required')" \
+	"1"
+eq "a query without k fails" \
+	"$(session "SELECT count(*) FROM docs_mmr WHERE text MATCH 'cat';" | grep -c 'MATCH and k are required')" \
+	"1"
+
 # Two columns, so bm25's column weights change the order: rowid 1 has "cat" once
 # in its title, rowid 2 three times in its body, every row four tokens long, and
 # the "bird" rows keep "cat"'s IDF positive. Unweighted, rowid 2 ranks first;

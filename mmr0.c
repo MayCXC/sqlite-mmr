@@ -291,8 +291,16 @@ static int mmrDestroy(sqlite3_vtab *pVtab) {
 **   'R' = rowid IN (...), all of its values in one argument
 **   'F' = rank MATCH, the source's ranking function
 **
-** MATCH + k are required.  mmr_lambda is optional (default 1.0), and so is
-** rank MATCH (default: the source's own rank).
+** MATCH + k are required, held to SQLite's rule for a table-valued function's
+** required parameters (https://www.sqlite.org/vtab.html, "Enforcing Required
+** Parameters On Table-Valued Functions"): a plan in which either is present
+** but cannot be supplied is refused with SQLITE_CONSTRAINT, so the planner
+** takes an order that supplies it, and a query that omits either fails with
+** an error.  SQLite leaves out of aConstraint[] a constraint that no join
+** order may use, such as one taking its value from a table a CROSS JOIN reads
+** after this one or one in the ON clause of a LEFT JOIN this table leads, so
+** such a query fails the same way.  mmr_lambda is optional (default 1.0), and
+** so is rank MATCH (default: the source's own rank).
 ** rowid IN (...) is optional and taken all at once through sqlite3_vtab_in(),
 ** as vec0 takes it for a KNN query (https://github.com/asg017/sqlite-vec,
 ** vec0BestIndex and vec0Filter_knn): one such constraint per query, its
@@ -314,12 +322,16 @@ static int mmrDestroy(sqlite3_vtab *pVtab) {
 #define MMR_IDXSTR_KIND_RANK     'F'
 
 static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
-  (void)pVtab;
   int iMatch = -1, iK = -1, iLambda = -1, iRowidIn = -1, iRank = -1;
+  int hasMatch = 0, hasK = 0;
 
   for (int i = 0; i < pInfo->nConstraint; i++) {
     int col = pInfo->aConstraint[i].iColumn;
     int op = pInfo->aConstraint[i].op;
+    int isMatch = op == SQLITE_INDEX_CONSTRAINT_MATCH && (col == 1 || col == -1);
+    int isK = col == 2 && op == SQLITE_INDEX_CONSTRAINT_EQ;
+    hasMatch |= isMatch;
+    hasK |= isK;
 #if MMR_SUPPORTS_VTAB_IN
     if (!pInfo->aConstraint[i].usable && col == -1 &&
         op == SQLITE_INDEX_CONSTRAINT_EQ &&
@@ -330,11 +342,11 @@ static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     if (!pInfo->aConstraint[i].usable)
       continue;
 
-    if (op == SQLITE_INDEX_CONSTRAINT_MATCH && (col == 1 || col == -1)) {
+    if (isMatch) {
       iMatch = i;
     } else if (op == SQLITE_INDEX_CONSTRAINT_MATCH && col == 0 && iRank < 0) {
       iRank = i;
-    } else if (col == 2 && op == SQLITE_INDEX_CONSTRAINT_EQ) {
+    } else if (isK) {
       iK = i;
     } else if (col == 3 && op == SQLITE_INDEX_CONSTRAINT_EQ) {
       iLambda = i;
@@ -353,10 +365,12 @@ static int mmrBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
 #endif
   }
 
-  if (iMatch < 0 || iK < 0) {
-    pInfo->estimatedCost = 1e12;
-    return SQLITE_OK;
+  if (!hasMatch || !hasK) {
+    vtab_set_error(pVtab, "mmr: MATCH and k are required where the table is read");
+    return SQLITE_ERROR;
   }
+  if (iMatch < 0 || iK < 0)
+    return SQLITE_CONSTRAINT;
 
   /* Build idxStr: 4 bytes per constraint, '_' padding */
   sqlite3_str *idxStr = sqlite3_str_new(NULL);
